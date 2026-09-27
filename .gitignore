@@ -1,0 +1,126 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ai_venv/
+*venv*/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm
+
+# AI models
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.onnx
+*.onnx_data
+*.gguf
+
+# Model/cache directories
+**/models/
+**/.cache/
+**/huggingface/
+**/checkpoints/
+
+# Runtime storage
+storage/*
+!storage/uploads/
+!storage/uploads/.gitkeep
+!storage/generated/
+!storage/generated/.gitkeep
+!storage/renders/
+!storage/renders/.gitkeep
+!storage/presenters/
+!storage/presenters/.gitkeep
+!storage/projects/
+!storage/projects/.gitkeep
+
+# MuseTalk runtime data
+musetalk-mac/models/
+musetalk-mac/checkpoints/
+musetalk-mac/outputs/
+musetalk-mac/results/
+musetalk-mac/.venv/
+
+# Media
+*.mp4
+*.mov
+*.avi
+*.webm
+*.mkv
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.aiff
+*.flac
+
+# Images generated/uploaded at runtime
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# Logs
+*.log
+logs/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Temporary files
+tmp/
+temp/
+*.tmp
