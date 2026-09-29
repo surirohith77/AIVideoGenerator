@@ -124,7 +124,8 @@ class LocalPresenterProvider(PresenterProvider):
                 "--video_path", face_reference_path,
                 "--audio_path", audio_path,
                 "--output_path", output_clip_path,
-                "--device", "mps"
+                "--device", "mps",
+                "--batch_size", "1"
             ]
             logger.info(f"Executing Apple-Silicon MuseTalk inference: {' '.join(cmd)}")
             print("[MuseTalk] Inference started")

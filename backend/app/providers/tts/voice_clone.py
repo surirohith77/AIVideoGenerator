@@ -100,6 +100,11 @@ class LocalVoiceCloneProvider(TTSProvider):
                 torchaudio.load = _patched_ta_load
                 torch._xtts_patched = True
 
+            import gc
+            import resource
+            rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
+            print(f"[Memory] Before XTTS: RSS={rss_mb:.2f} MB")
+
             from TTS.api import TTS
             device = "cuda" if torch.cuda.is_available() else ("mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu")
             logger.info(f"Loaded Coqui TTS API on device={device}")
@@ -112,9 +117,19 @@ class LocalVoiceCloneProvider(TTSProvider):
                     language="en",
                     file_path=output_path
                 )
+                del tts
             
             # 5 minute timeout for TTS inference to prevent infinite hanging
             await asyncio.wait_for(asyncio.to_thread(run_tts_inference), timeout=300.0)
+
+            print("[XTTS] Generation complete")
+            print("[XTTS] Releasing memory before MuseTalk")
+            gc.collect()
+            if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+
+            rss_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
+            print(f"[Memory] After XTTS: RSS={rss_after:.2f} MB")
 
             if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
                 verification = await verify_output_media_file(output_path, require_audio=True)
