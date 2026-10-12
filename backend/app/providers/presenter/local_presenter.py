@@ -118,6 +118,14 @@ class LocalPresenterProvider(PresenterProvider):
         # 1. Primary Execution: Dedicated Apple-Silicon MuseTalk Runtime (.venv)
         inference_script = os.path.join(self.musetalk_dir, "inference.py")
         if os.path.exists(self.musetalk_python) and os.path.exists(inference_script):
+            enable_post_proc = os.getenv("ENABLE_MUSETALK_POST_PROCESSING", "1").lower() in ("1", "true", "yes")
+            if settings and "enable_post_processing" in settings:
+                enable_post_proc = bool(settings["enable_post_processing"])
+
+            parsing_mode = os.getenv("MUSETALK_PARSING_MODE", "inner_mouth")
+            if settings and "parsing_mode" in settings:
+                parsing_mode = str(settings["parsing_mode"])
+
             cmd = [
                 self.musetalk_python,
                 inference_script,
@@ -125,8 +133,12 @@ class LocalPresenterProvider(PresenterProvider):
                 "--audio_path", audio_path,
                 "--output_path", output_clip_path,
                 "--device", "mps",
-                "--batch_size", "1"
+                "--batch_size", "1",
+                "--parsing_mode", parsing_mode
             ]
+            if enable_post_proc:
+                cmd.append("--enable_post_processing")
+
             logger.info(f"Executing Apple-Silicon MuseTalk inference: {' '.join(cmd)}")
             print("[MuseTalk] Inference started")
             
