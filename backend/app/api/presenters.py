@@ -61,6 +61,32 @@ async def record_reference_asset(
     db.refresh(presenter)
     return presenter
 
+
+@router.post("/{presenter_id}/recording-reference", response_model=PresenterResponse)
+async def record_combined_reference(
+    presenter_id: str,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    presenter = presenter_service.get_presenter_by_id(db, presenter_id)
+    if not presenter or presenter.user_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Presenter not found")
+
+    try:
+        await presenter_service.save_presenter_recording_reference(
+            db=db,
+            presenter_id=presenter_id,
+            file_obj=file.file,
+            filename=file.filename or "presenter_recording.webm",
+            mime_type=file.content_type or "video/webm",
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+    db.refresh(presenter)
+    return presenter
+
 @router.post("/{presenter_id}/test-generation")
 async def test_presenter_generation(
     presenter_id: str,

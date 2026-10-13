@@ -140,14 +140,106 @@ async def save_presenter_reference_asset(
     else:
         presenter.voice_reference_asset_id = asset.id
 
-    # Mark Presenter READY if face reference exists
-    if presenter.face_reference_asset_id:
+    # A presenter is ready only after both reference modalities are available.
+    if presenter.face_reference_asset_id and presenter.voice_reference_asset_id:
         presenter.status = PresenterStatus.READY.value
+    else:
+        presenter.status = PresenterStatus.PROCESSING.value
 
     db.commit()
     db.refresh(presenter)
     db.refresh(asset)
     return asset
+
+
+async def save_presenter_recording_reference(
+    db: Session,
+    presenter_id: str,
+    file_obj: BinaryIO,
+    filename: str,
+    mime_type: str,
+) -> tuple[Asset, Asset]:
+    """Store one camera recording and attach its video and extracted audio together."""
+    presenter = get_presenter_by_id(db, presenter_id)
+    if not presenter:
+        raise ValueError("Presenter not found")
+
+    extension = os.path.splitext(os.path.basename(filename or ""))[1].lower()
+    if extension not in {".webm", ".mp4", ".mov", ".m4v"}:
+        extension = ".mp4" if "mp4" in (mime_type or "") else ".webm"
+
+    recording_id = uuid.uuid4()
+    folder = os.path.join(storage_provider.base_dir, "presenters", presenter_id)
+    os.makedirs(folder, exist_ok=True)
+    video_path = os.path.join(folder, f"recording_{recording_id}{extension}")
+    audio_path = os.path.join(folder, f"voice_{recording_id}.wav")
+    relative_path = os.path.relpath(video_path, storage_provider.base_dir)
+    await storage_provider.save_file(file_obj, relative_path)
+
+    try:
+        probe = await asyncio.create_subprocess_exec(
+            "ffprobe", "-v", "error", "-show_entries", "stream=codec_type",
+            "-of", "csv=p=0", video_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stream_output, probe_error = await probe.communicate()
+        stream_types = set(stream_output.decode("utf-8", errors="ignore").splitlines())
+        if probe.returncode != 0 or "video" not in stream_types or "audio" not in stream_types:
+            detail = probe_error.decode("utf-8", errors="ignore").strip()
+            raise ValueError(
+                "The presenter recording must contain both video and audio. "
+                + (detail or "Please record again with camera and microphone enabled.")
+            )
+
+        extract = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-v", "error", "-i", video_path,
+            "-map", "0:a:0", "-vn", "-acodec", "pcm_s16le", "-ar", "22050", "-ac", "1",
+            audio_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, extract_error = await extract.communicate()
+        if extract.returncode != 0 or not os.path.isfile(audio_path) or os.path.getsize(audio_path) <= 1024:
+            detail = extract_error.decode("utf-8", errors="ignore").strip()
+            raise ValueError(f"Could not extract the voice reference from the recording: {detail}")
+
+        video_asset = Asset(
+            project_id=None,
+            type=AssetType.PRESENTER_FACE_REFERENCE.value,
+            filename=os.path.basename(video_path),
+            path=video_path,
+            mime_type=mime_type or "video/webm",
+            size=os.path.getsize(video_path),
+            tags="presenter, face, recording",
+        )
+        voice_asset = Asset(
+            project_id=None,
+            type=AssetType.PRESENTER_VOICE_REFERENCE.value,
+            filename="voice_reference.wav",
+            path=audio_path,
+            mime_type="audio/wav",
+            size=os.path.getsize(audio_path),
+            tags="presenter, voice, extracted",
+        )
+        db.add_all([video_asset, voice_asset])
+        db.flush()
+
+        presenter.face_reference_asset_id = video_asset.id
+        presenter.voice_reference_asset_id = voice_asset.id
+        presenter.status = PresenterStatus.READY.value
+        db.commit()
+    except Exception:
+        db.rollback()
+        for path in (video_path, audio_path):
+            if os.path.exists(path):
+                os.remove(path)
+        raise
+
+    db.refresh(presenter)
+    db.refresh(video_asset)
+    db.refresh(voice_asset)
+    return video_asset, voice_asset
 
 def delete_presenter(db: Session, presenter_id: str) -> bool:
     presenter = get_presenter_by_id(db, presenter_id)
@@ -176,8 +268,8 @@ async def get_or_generate_presenter_clip(
     settings: Optional[dict] = None
 ) -> str:
     presenter = get_presenter_by_id(db, presenter_id)
-    if not presenter or not presenter.face_reference:
-        raise ValueError("Valid presenter with face reference required.")
+    if not presenter or not presenter.face_reference or not os.path.isfile(presenter.face_reference.path):
+        raise ValueError("The selected presenter is missing a usable video reference. Record or upload a camera video first.")
 
     face_path = presenter.face_reference.path
     audio_hash = compute_file_hash(audio_path)
@@ -279,7 +371,7 @@ async def test_presenter_generation(db: Session, presenter_id: str, text: str) -
         "face_reference_path": face_ref_path,
         "generated_audio_path": generated_audio_path,
         "generated_video_path": generated_video_path,
-        "voice_engine": os.getenv("LOCAL_VOICE_ENGINE", "xtts_v2"),
+        "voice_engine": os.getenv("LOCAL_VOICE_ENGINE", "f5_tts"),
         "presenter_engine": os.getenv("LOCAL_PRESENTER_ENGINE", "musetalk"),
         "voice_verification": audio_ver,
         "video_verification": video_ver,

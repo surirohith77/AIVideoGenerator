@@ -58,7 +58,7 @@ def get_system_capabilities():
         local_presenter_available=True,
         voice_clone_status=voice_clone_status,
         presenter_model_status=pres_status_info["status"],
-        voice_engine=os.getenv("LOCAL_VOICE_ENGINE", "xtts_v2"),
+        voice_engine=os.getenv("LOCAL_VOICE_ENGINE", "f5_tts"),
         presenter_engine=os.getenv("LOCAL_PRESENTER_ENGINE", "musetalk"),
         estimated_performance=perf
     )

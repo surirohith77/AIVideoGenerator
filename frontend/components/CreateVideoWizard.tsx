@@ -33,6 +33,10 @@ export const CreateVideoWizard: React.FC<CreateVideoWizardProps> = ({
     queryKey: ["presenters"],
     queryFn: presenterApi.list,
   });
+  const selectedPresenter = presenters.find((presenter) => presenter.id === selectedPresenterId);
+  const presenterModeMissingVoice = experienceMode === "PRESENTER" && (
+    !selectedPresenter || !selectedPresenter.voice_reference_asset_id
+  );
 
   const analyzeAndGenerateMutation = useMutation({
     mutationFn: async () => {
@@ -269,9 +273,14 @@ export const CreateVideoWizard: React.FC<CreateVideoWizardProps> = ({
       </div>
 
       {/* Generate Video Action Button */}
+      {presenterModeMissingVoice && (
+        <p role="status" className="text-xs text-amber-300">
+          Presenter mode needs a selected presenter with a recorded voice reference. Choose one above or switch to Content mode.
+        </p>
+      )}
       <button
         onClick={() => analyzeAndGenerateMutation.mutate()}
-        disabled={analyzeAndGenerateMutation.isPending || !content.trim()}
+        disabled={analyzeAndGenerateMutation.isPending || !content.trim() || presenterModeMissingVoice}
         className="w-full flex items-center justify-center gap-3 py-4 rounded-2xl bg-gradient-to-r from-indigo-600 via-purple-600 to-pink-600 hover:from-indigo-500 hover:to-pink-500 text-white font-extrabold text-base shadow-2xl shadow-indigo-600/30 transition-all disabled:opacity-50 hover:scale-[1.01]"
       >
         {analyzeAndGenerateMutation.isPending ? (

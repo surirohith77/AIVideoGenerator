@@ -1,13 +1,131 @@
 import os
 import asyncio
 import hashlib
+import json
 import logging
+import shutil
 import wave
+from collections import deque
+from pathlib import Path
 from typing import Optional, Dict, Any
 from app.providers.tts.base import TTSProvider
 from app.utils.media_verification import verify_output_media_file
 
 logger = logging.getLogger(__name__)
+
+_F5_TTS_ENGINES = {"f5", "f5_tts", "f5-tts"}
+_XTTS_ENGINES = {"xtts", "xtts_v2", "xtts-v2"}
+_F5_WORKER_PROCESS: Optional[asyncio.subprocess.Process] = None
+_F5_WORKER_LOCK = asyncio.Lock()
+_F5_WORKER_STDERR_TASK: Optional[asyncio.Task] = None
+_F5_WORKER_STDERR_TAIL = deque(maxlen=30)
+_DEFAULT_F5_REFERENCE_TEXT = (
+    "Hi, thanks for taking a moment to listen. I'm going to talk about a few everyday things in my own words."
+)
+
+
+def _f5_python_executable() -> Optional[str]:
+    configured = os.getenv("F5_TTS_PYTHON", "").strip()
+    if configured:
+        return configured if os.path.isfile(configured) else shutil.which(configured)
+
+    backend_root = Path(__file__).resolve().parents[3]
+    executable_name = "python.exe" if os.name == "nt" else "python"
+    candidate = backend_root / "f5_venv" / ("Scripts" if os.name == "nt" else "bin") / executable_name
+    return str(candidate) if candidate.is_file() else None
+
+
+async def _log_f5_worker_stderr(process: asyncio.subprocess.Process) -> None:
+    if not process.stderr:
+        return
+    while line := await process.stderr.readline():
+        decoded_line = line.decode("utf-8", errors="replace").rstrip()
+        _F5_WORKER_STDERR_TAIL.append(decoded_line)
+        logger.info("F5-TTS worker: %s", decoded_line)
+
+
+async def _ensure_f5_worker() -> asyncio.subprocess.Process:
+    global _F5_WORKER_PROCESS, _F5_WORKER_STDERR_TASK
+
+    if _F5_WORKER_PROCESS and _F5_WORKER_PROCESS.returncode is None:
+        return _F5_WORKER_PROCESS
+
+    python_executable = _f5_python_executable()
+    if not python_executable:
+        raise RuntimeError(
+            "F5-TTS runtime is missing. Run backend/scripts/setup_f5_tts.sh or set F5_TTS_PYTHON."
+        )
+
+    worker_script = Path(__file__).with_name("f5_tts_worker.py")
+    _F5_WORKER_STDERR_TAIL.clear()
+    process = await asyncio.create_subprocess_exec(
+        python_executable,
+        str(worker_script),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _F5_WORKER_PROCESS = process
+    _F5_WORKER_STDERR_TASK = asyncio.create_task(_log_f5_worker_stderr(process))
+
+    startup_timeout = float(os.getenv("F5_TTS_STARTUP_TIMEOUT_SECONDS", "900"))
+    try:
+        ready_line = await asyncio.wait_for(process.stdout.readline(), timeout=startup_timeout)
+        ready_response = json.loads(ready_line.decode("utf-8")) if ready_line else {}
+    except Exception:
+        process.kill()
+        await process.wait()
+        _F5_WORKER_PROCESS = None
+        raise
+
+    if not ready_response.get("ready"):
+        process.kill()
+        await process.wait()
+        _F5_WORKER_PROCESS = None
+        detail = ready_response.get("error", "The F5-TTS worker failed to initialize.")
+        raise RuntimeError(detail)
+
+    logger.info("F5-TTS worker is ready")
+    return process
+
+
+async def _run_f5_worker(request: Dict[str, Any], timeout: float) -> None:
+    global _F5_WORKER_PROCESS
+
+    async with _F5_WORKER_LOCK:
+        process = await _ensure_f5_worker()
+        if not process.stdin or not process.stdout:
+            raise RuntimeError("F5-TTS worker pipes are unavailable.")
+
+        process.stdin.write((json.dumps(request) + "\n").encode("utf-8"))
+        await process.stdin.drain()
+        try:
+            response_line = await asyncio.wait_for(process.stdout.readline(), timeout=timeout)
+        except asyncio.TimeoutError as error:
+            process.kill()
+            await process.wait()
+            _F5_WORKER_PROCESS = None
+            raise RuntimeError(f"F5-TTS inference exceeded its {timeout:.0f}-second timeout.") from error
+
+        if not response_line:
+            await process.wait()
+            if _F5_WORKER_STDERR_TASK:
+                await _F5_WORKER_STDERR_TASK
+            _F5_WORKER_PROCESS = None
+            diagnostics = [
+                line for line in _F5_WORKER_STDERR_TAIL
+                if not line.lstrip().startswith(("ref_text", "gen_text"))
+            ]
+            diagnostic_tail = "\n".join(diagnostics[-8:])
+            exit_status = f"exit code {process.returncode}"
+            detail = f" Worker output: {diagnostic_tail}" if diagnostic_tail else ""
+            raise RuntimeError(
+                f"F5-TTS worker stopped before returning an audio result ({exit_status}).{detail}"
+            )
+
+        response = json.loads(response_line.decode("utf-8"))
+        if not response.get("ok"):
+            raise RuntimeError(response.get("error", "F5-TTS inference failed."))
 
 class LocalVoiceCloneProvider(TTSProvider):
     """
@@ -16,7 +134,7 @@ class LocalVoiceCloneProvider(TTSProvider):
     Strictly fails if voice reference or model is unavailable for Presenter mode.
     """
     def __init__(self):
-        self.engine_name = os.getenv("LOCAL_VOICE_ENGINE", "xtts_v2").lower()
+        self.engine_name = os.getenv("LOCAL_VOICE_ENGINE", "f5_tts").lower()
         self.model_path = os.getenv("VOICE_MODEL_PATH", "")
 
     @staticmethod
@@ -24,6 +142,13 @@ class LocalVoiceCloneProvider(TTSProvider):
         """
         Verifies if local voice cloning model runtime or checkpoints are available.
         """
+        engine_name = os.getenv("LOCAL_VOICE_ENGINE", "f5_tts").lower()
+        if engine_name in _F5_TTS_ENGINES:
+            return bool(_f5_python_executable())
+
+        if engine_name not in _XTTS_ENGINES:
+            return False
+
         model_dir = os.getenv("VOICE_MODEL_PATH", "")
         if model_dir and os.path.exists(model_dir):
             return True
@@ -106,6 +231,14 @@ class LocalVoiceCloneProvider(TTSProvider):
             )
 
         speaker_reference_path = await self._prepare_voice_reference(voice_reference_path)
+
+        if self.engine_name in _F5_TTS_ENGINES:
+            return await self._generate_f5_audio(text, output_path, speaker_reference_path)
+        if self.engine_name not in _XTTS_ENGINES:
+            raise RuntimeError(
+                f"Unsupported LOCAL_VOICE_ENGINE '{self.engine_name}'. "
+                "Choose f5_tts or xtts_v2."
+            )
 
         # Set TOS agreement automatically to avoid hanging stdout/stdin prompts
         os.environ["COQUI_TOS_AGREED"] = "1"
@@ -256,3 +389,27 @@ class LocalVoiceCloneProvider(TTSProvider):
             f"Voice cloning model ({self.engine_name}) is not installed or failed to execute. "
             f"Presenter voice cloning requires XTTS-v2 runtime or model weights at '{self.model_path}'."
         )
+
+    async def _generate_f5_audio(self, text: str, output_path: str, reference_path: str) -> str:
+        request = {
+            "reference_path": reference_path,
+            "reference_text": os.getenv("F5_TTS_REFERENCE_TEXT", _DEFAULT_F5_REFERENCE_TEXT).strip(),
+            "text": text,
+            "output_path": output_path,
+            "nfe_step": int(os.getenv("F5_TTS_NFE_STEP", "32")),
+            "speed": float(os.getenv("F5_TTS_SPEED", "1.2")),
+            "cfg_strength": float(os.getenv("F5_TTS_CFG_STRENGTH", "2.0")),
+        }
+        timeout = float(os.getenv("F5_TTS_TIMEOUT_SECONDS", "900"))
+        await _run_f5_worker(request, timeout=timeout)
+
+        if not os.path.isfile(output_path) or os.path.getsize(output_path) <= 1024:
+            raise RuntimeError("F5-TTS completed without producing a valid audio file.")
+
+        verification = await verify_output_media_file(output_path, require_audio=True)
+        logger.info(
+            "F5-TTS audio verified: size=%sB, duration=%ss",
+            verification["size"],
+            verification["duration"],
+        )
+        return output_path

@@ -10,8 +10,11 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY requirements.txt requirements-f5.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m venv /opt/f5-venv \
+    && /opt/f5-venv/bin/pip install --no-cache-dir -r requirements-f5.txt
+ENV F5_TTS_PYTHON=/opt/f5-venv/bin/python
 
 COPY . .
 

@@ -68,7 +68,7 @@ class SystemCapabilitiesResponse(BaseModel):
     local_presenter_available: bool = True
     voice_clone_status: str = "NOT_INSTALLED"
     presenter_model_status: str = "NOT_INSTALLED"
-    voice_engine: str = "xtts_v2"
+    voice_engine: str = "f5_tts"
     presenter_engine: str = "musetalk"
     estimated_performance: str = "Good (Local CPU / Engine)"
 

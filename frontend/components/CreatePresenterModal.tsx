@@ -171,11 +171,11 @@ export const CreatePresenterModal: React.FC<CreatePresenterModalProps> = ({ onCl
       });
 
       const extension = getFileExtension(cameraRecordedBlob.type);
-      const faceFile = new File([cameraRecordedBlob], `face_reference.${extension}`, { type: cameraRecordedBlob.type });
-      const voiceFile = new File([cameraRecordedBlob], `voice_reference.${extension}`, { type: cameraRecordedBlob.type });
-      await presenterApi.recordReference(presenter.id, "FACE", faceFile);
-      // The backend extracts and normalizes the audio track from this exact video take.
-      await presenterApi.recordReference(presenter.id, "VOICE", voiceFile);
+      const recordingFile = new File([cameraRecordedBlob], `presenter_recording.${extension}`, {
+        type: cameraRecordedBlob.type,
+      });
+      // The backend saves this recording as the face reference and atomically extracts its voice reference.
+      await presenterApi.recordCombinedReference(presenter.id, recordingFile);
 
       const updated = await presenterApi.get(presenter.id);
       onCreated(updated);

@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
@@ -6,6 +7,7 @@ from app.api.auth import get_current_user
 from app.models.models import User, JobStatus
 from app.schemas.schemas import VideoJobResponse, VideoJobCreate
 from app.services import rendering_service, script_service
+from app.services import presenter_service
 
 router = APIRouter(tags=["Video Jobs"])
 
@@ -23,6 +25,26 @@ def trigger_video_generation(
 
     gen_mode = job_in.generation_mode if job_in else "CONTENT"
     pres_id = job_in.presenter_id if job_in else None
+
+    if gen_mode.upper() == "PRESENTER":
+        if not pres_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Select a presenter with a recorded voice reference before starting Presenter mode.",
+            )
+        presenter = presenter_service.get_presenter_by_id(db, pres_id)
+        if not presenter or presenter.user_id != current_user.id:
+            raise HTTPException(status_code=404, detail="Presenter not found")
+        if not presenter.face_reference or not os.path.isfile(presenter.face_reference.path):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Presenter '{presenter.name}' is missing a usable video reference. Record a camera video before generating.",
+            )
+        if not presenter.voice_reference or not os.path.isfile(presenter.voice_reference.path):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Presenter '{presenter.name}' is missing a usable voice reference. Record or upload one before generating video.",
+            )
 
     job = rendering_service.create_video_job(
         db=db,

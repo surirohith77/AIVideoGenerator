@@ -96,22 +96,33 @@ async def execute_video_generation_job(db_session_factory, job_id: str):
                 bool(sc.presenter_id)
             )
 
+            if scene_is_presenter and not presenter_target_id:
+                raise ValueError(
+                    f"Scene {sc.scene_number} uses Presenter mode, but no presenter was selected. "
+                    "Select a presenter with a recorded voice reference and try again."
+                )
+
             # Fetch voice reference audio path if available
             voice_ref_path = None
             if presenter_target_id:
                 pres_obj = db.query(Presenter).filter(Presenter.id == presenter_target_id).first()
-                if pres_obj:
-                    if pres_obj.voice_reference and os.path.exists(pres_obj.voice_reference.path):
-                        voice_ref_path = pres_obj.voice_reference.path
-                    elif scene_is_presenter:
-                        raise ValueError(f"ERROR: Presenter '{pres_obj.name}' is missing a voice reference. Please record/upload a voice reference audio file before generating presenter video.")
+                if not pres_obj:
+                    raise ValueError(f"Selected presenter '{presenter_target_id}' was not found.")
+                if pres_obj.voice_reference and os.path.isfile(pres_obj.voice_reference.path):
+                    voice_ref_path = pres_obj.voice_reference.path
+                elif scene_is_presenter or presenter_target_id:
+                    raise ValueError(
+                        f"Presenter '{pres_obj.name}' is missing a usable voice reference. "
+                        "Please record or upload a voice reference before generating this video."
+                    )
 
             if sc.narration:
                 job.progress = 35
                 job.current_stage = f"GENERATING_VOICE_SCENE_{sc.scene_number}"
                 db.commit()
 
-                await voice_clone_provider.generate_audio(
+                audio_provider = voice_clone_provider if voice_ref_path else tts_provider
+                await audio_provider.generate_audio(
                     text=sc.narration,
                     output_path=sc_audio_path,
                     voice_reference_path=voice_ref_path
