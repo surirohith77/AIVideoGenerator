@@ -15,6 +15,7 @@ from app.providers.tts.local_tts import LocalTTSProvider
 from app.services.presenter_service import get_or_generate_presenter_clip
 from app.config import settings
 from renderer.ffmpeg_builder import FFmpegRenderer
+from app.utils.ffmpeg_utils import extract_media_metadata
 
 logger = logging.getLogger(__name__)
 tts_provider = LocalTTSProvider()
@@ -150,10 +151,24 @@ async def execute_video_generation_job(db_session_factory, job_id: str):
                     if asset and os.path.exists(asset.path):
                         asset_path = asset.path
 
+            scene_duration = float(sc.duration or 6.0)
+            if os.path.exists(sc_audio_path):
+                audio_metadata = await extract_media_metadata(sc_audio_path)
+                audio_duration = float(audio_metadata.get("duration") or 0.0)
+                if audio_metadata.get("has_audio") and audio_duration > 0:
+                    if abs(scene_duration - audio_duration) > 0.05:
+                        logger.info(
+                            "Using narration duration %.3fs instead of configured scene duration %.3fs for scene %s",
+                            audio_duration,
+                            scene_duration,
+                            sc.scene_number,
+                        )
+                    scene_duration = audio_duration
+
             scene_dicts.append({
                 "scene_number": sc.scene_number,
                 "narration": sc.narration,
-                "duration": sc.duration,
+                "duration": scene_duration,
                 "visual_type": visual_type,
                 "transition": sc.transition,
                 "caption": sc.caption or sc.narration,

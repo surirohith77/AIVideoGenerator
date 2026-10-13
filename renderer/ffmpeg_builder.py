@@ -70,11 +70,14 @@ class FFmpegRenderer:
         asset_path = scene.get("asset_path")
         visual_type = scene.get("visual_type", "IMAGE")
         duration = float(scene.get("duration", 6.0))
+        frame_count = int(scene.get("_frame_count", round(duration * 30)))
+        render_duration = frame_count / 30.0
 
         if not asset_path or not os.path.exists(asset_path):
             cmd = [
                 "ffmpeg", "-y", "-f", "lavfi",
-                "-i", f"color=c=0x0f172a:s={width}x{height}:d={duration}",
+                "-i", f"color=c=0x0f172a:s={width}x{height}:d={render_duration}",
+                "-frames:v", str(frame_count), "-an",
                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30", output_clip_path
             ]
             proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -83,22 +86,28 @@ class FFmpegRenderer:
 
         if visual_type == "IMAGE":
             motion_type = scene.get("motion_type") or get_random_motion_effect(scene_index)
-            kb_filter = get_ken_burns_filter(motion_type, width=width, height=height, duration=duration, fps=30)
+            kb_filter = get_ken_burns_filter(motion_type, width=width, height=height, duration=render_duration, fps=30)
             filtergraph = f"scale=-2:{height}*2,crop=iw:ih,format=yuv420p,{kb_filter}"
             
             cmd = [
                 "ffmpeg", "-y", "-loop", "1", "-i", asset_path,
                 "-vf", filtergraph,
-                "-t", str(duration),
+                "-frames:v", str(frame_count), "-an",
                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
                 output_clip_path
             ]
         else:
-            filtergraph = f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},format=yuv420p"
+            filtergraph = (
+                f"setpts=PTS-STARTPTS,fps=30:start_time=0,"
+                f"tpad=stop_mode=clone:stop_duration={render_duration},"
+                f"trim=end_frame={frame_count},setpts=PTS-STARTPTS,"
+                f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+                f"crop={width}:{height},format=yuv420p"
+            )
             cmd = [
                 "ffmpeg", "-y", "-i", asset_path,
                 "-vf", filtergraph,
-                "-t", str(duration),
+                "-frames:v", str(frame_count), "-an",
                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
                 output_clip_path
             ]
@@ -124,9 +133,19 @@ class FFmpegRenderer:
         with tempfile.TemporaryDirectory() as temp_dir:
             clip_paths = []
             audio_paths = []
+            render_scenes = []
+            cumulative_duration = 0.0
+            previous_frame_end = 0
+            for scene in scenes:
+                render_scene = dict(scene)
+                cumulative_duration += float(scene.get("duration", 6.0))
+                frame_end = round(cumulative_duration * 30)
+                render_scene["_frame_count"] = frame_end - previous_frame_end
+                previous_frame_end = frame_end
+                render_scenes.append(render_scene)
 
             # Step 1: Render individual scene clips
-            for idx, scene in enumerate(scenes, 1):
+            for idx, scene in enumerate(render_scenes, 1):
                 if progress_callback:
                     await progress_callback(stage="CREATING_SCENES", progress=int(20 + (idx / len(scenes)) * 40))
                 
@@ -134,8 +153,8 @@ class FFmpegRenderer:
                 await self.render_scene_clip(scene, idx, width, height, clip_file)
                 clip_paths.append(clip_file)
 
-                if scene.get("audio_path") and os.path.exists(scene.get("audio_path")):
-                    audio_paths.append(scene.get("audio_path"))
+                audio_path = scene.get("audio_path")
+                audio_paths.append(audio_path if audio_path and os.path.exists(audio_path) else None)
 
             # Step 2: Concatenate scene clips
             concat_list_file = os.path.join(temp_dir, "clips.txt")
@@ -154,7 +173,35 @@ class FFmpegRenderer:
 
             # Step 3: Concatenate narration audio
             merged_narration_path = None
-            if audio_paths:
+            if any(audio_paths):
+                # Keep the audio timeline in lockstep with the scene clips. A scene
+                # without narration still occupies time in the video, so represent
+                # it with silence instead of removing it from the audio concat.
+                for idx, (scene, audio_path) in enumerate(zip(render_scenes, audio_paths)):
+                    if audio_path is not None:
+                        continue
+
+                    duration = max(float(scene.get("duration", 6.0)), 0.001)
+                    silence_path = os.path.join(temp_dir, f"silence_{idx + 1:03d}.wav")
+                    silence_cmd = [
+                        "ffmpeg", "-y", "-f", "lavfi",
+                        "-i", "anullsrc=r=44100:cl=stereo",
+                        "-t", f"{duration:.6f}",
+                        "-c:a", "pcm_s16le", silence_path
+                    ]
+                    proc = await asyncio.create_subprocess_exec(
+                        *silence_cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    _, stderr = await proc.communicate()
+                    if proc.returncode != 0:
+                        raise RuntimeError(
+                            f"Failed to create silent audio for scene {idx + 1}: "
+                            f"{stderr.decode('utf-8', errors='ignore')[-500:]}"
+                        )
+                    audio_paths[idx] = silence_path
+
                 audio_concat_file = os.path.join(temp_dir, "audio.txt")
                 with open(audio_concat_file, "w") as f:
                     for ap in audio_paths:
@@ -174,7 +221,7 @@ class FFmpegRenderer:
 
             # Step 4: Final FFmpeg Assembly
             ffmpeg_inputs = ["-i", merged_visual_path]
-            filter_complex_parts = []
+            filter_complex_parts = ["[0:v]setpts=PTS-STARTPTS[vbase]"]
             input_idx = 1
 
             if merged_narration_path and os.path.exists(merged_narration_path):
@@ -202,14 +249,14 @@ class FFmpegRenderer:
             else:
                 logo_idx = None
 
-            video_stream = "0:v"
+            video_stream = "vbase"
             
             # Caption overlay (subtitles -> drawtext -> fallback)
-            scene_captions = [s.get("caption") or s.get("narration") for s in scenes if s.get("caption") or s.get("narration")]
+            scene_captions = [s.get("caption") or s.get("narration") for s in render_scenes if s.get("caption") or s.get("narration")]
             if scene_captions:
                 if has_ffmpeg_filter("subtitles"):
                     srt_path = os.path.join(temp_dir, "subtitles.srt")
-                    generate_srt_file(scenes, srt_path)
+                    generate_srt_file(render_scenes, srt_path)
                     clean_srt_path = srt_path.replace(":", "\\:").replace("'", "\\'")
                     filter_complex_parts.append(f"[{video_stream}]subtitles=filename='{clean_srt_path}':force_style='FontSize=22,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=3'[vsub]")
                     video_stream = "vsub"
@@ -253,7 +300,7 @@ class FFmpegRenderer:
                     final_cmd.extend(["-map", audio_stream])
                 final_cmd.extend(["-c:a", "aac", "-b:a", "192k"])
             else:
-                total_duration = sum(float(s.get("duration", 6.0)) for s in scenes)
+                total_duration = sum(float(s.get("duration", 6.0)) for s in render_scenes)
                 final_cmd.extend(["-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo", "-t", str(total_duration), "-c:a", "aac"])
 
             final_cmd.extend([

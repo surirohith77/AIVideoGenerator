@@ -1,6 +1,8 @@
 import os
 import asyncio
+import hashlib
 import logging
+import wave
 from typing import Optional, Dict, Any
 from app.providers.tts.base import TTSProvider
 from app.utils.media_verification import verify_output_media_file
@@ -34,6 +36,58 @@ class LocalVoiceCloneProvider(TTSProvider):
         except ImportError:
             return False
 
+    async def _prepare_voice_reference(self, voice_reference_path: str) -> str:
+        """Normalize uploaded media to the PCM WAV format XTTS expects.
+
+        Some browser recordings arrive as WebM/Opus even when named `.wav`.
+        The content-hash cache handles existing assets without modifying the
+        user's original recording.
+        """
+        digest = hashlib.sha256()
+        with open(voice_reference_path, "rb") as source:
+            for chunk in iter(lambda: source.read(65536), b""):
+                digest.update(chunk)
+
+        cache_dir = os.path.join(os.path.dirname(voice_reference_path), ".xtts_reference_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        prepared_path = os.path.join(cache_dir, f"{digest.hexdigest()}.wav")
+        if os.path.exists(prepared_path) and os.path.getsize(prepared_path) > 1024:
+            return prepared_path
+
+        cmd = [
+            "ffmpeg", "-y", "-v", "error", "-i", voice_reference_path,
+            "-vn", "-acodec", "pcm_s16le", "-ar", "22050", "-ac", "1",
+            prepared_path,
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0 or not os.path.exists(prepared_path) or os.path.getsize(prepared_path) <= 1024:
+            detail = stderr.decode("utf-8", errors="ignore").strip()
+            raise RuntimeError(f"Could not prepare XTTS voice reference as PCM WAV: {detail}")
+        return prepared_path
+
+    @staticmethod
+    def _reference_conditioning_options(reference_path: str) -> Dict[str, int]:
+        """Use one XTTS style chunk for short references to retain voice traits."""
+        try:
+            with wave.open(reference_path, "rb") as reference:
+                duration = reference.getnframes() / float(reference.getframerate())
+        except (OSError, wave.Error, ZeroDivisionError):
+            logger.warning("Could not read voice reference duration; using XTTS defaults")
+            return {}
+
+        conditioning_length = min(30, max(1, int(duration)))
+        if conditioning_length <= 10:
+            return {
+                "gpt_cond_len": conditioning_length,
+                "gpt_cond_chunk_len": conditioning_length,
+            }
+        return {"gpt_cond_len": conditioning_length, "gpt_cond_chunk_len": 4}
+
     async def generate_audio(
         self,
         text: str,
@@ -51,6 +105,8 @@ class LocalVoiceCloneProvider(TTSProvider):
                 "Please record or upload a voice reference audio file."
             )
 
+        speaker_reference_path = await self._prepare_voice_reference(voice_reference_path)
+
         # Set TOS agreement automatically to avoid hanging stdout/stdin prompts
         os.environ["COQUI_TOS_AGREED"] = "1"
 
@@ -58,6 +114,7 @@ class LocalVoiceCloneProvider(TTSProvider):
             f"\n========== AI VOICE CLONING ==========\n"
             f"Voice engine: {self.engine_name}\n"
             f"Voice reference: {voice_reference_path}\n"
+            f"XTTS PCM reference: {speaker_reference_path}\n"
             f"Output path: {output_path}\n"
             f"Script text: {text[:60]}...\n"
             f"======================================="
@@ -111,11 +168,13 @@ class LocalVoiceCloneProvider(TTSProvider):
             
             def run_tts_inference():
                 tts = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2").to(device)
+                conditioning_options = self._reference_conditioning_options(speaker_reference_path)
                 tts.tts_to_file(
                     text=text,
-                    speaker_wav=voice_reference_path,
+                    speaker_wav=speaker_reference_path,
                     language="en",
-                    file_path=output_path
+                    file_path=output_path,
+                    **conditioning_options,
                 )
                 del tts
             
@@ -146,7 +205,7 @@ class LocalVoiceCloneProvider(TTSProvider):
                 tts_cli,
                 "--model_name", "tts_models/multilingual/multi-dataset/xtts_v2",
                 "--text", text,
-                "--speaker_wav", voice_reference_path,
+                "--speaker_wav", speaker_reference_path,
                 "--language_idx", "en",
                 "--out_path", output_path
             ]
@@ -175,7 +234,7 @@ class LocalVoiceCloneProvider(TTSProvider):
                 cmd = [
                     "python3", script_path,
                     "--text", text,
-                    "--reference_wav", voice_reference_path,
+                    "--reference_wav", speaker_reference_path,
                     "--output", output_path
                 ]
                 proc = await asyncio.create_subprocess_exec(

@@ -1,3 +1,4 @@
+import asyncio
 import os
 import uuid
 import hashlib
@@ -68,30 +69,50 @@ async def save_presenter_reference_asset(
         raise ValueError("Presenter not found")
 
     safe_filename = filename or f"{reference_kind.lower()}_reference.mp4"
-    ext = os.path.splitext(safe_filename)[1] if (safe_filename and os.path.splitext(safe_filename)[1]) else (".mp4" if reference_kind == "FACE" else ".wav")
-    unique_fn = f"{reference_kind.lower()}_{uuid.uuid4()}{ext}"
-    relative_path = os.path.join("presenters", presenter_id, unique_fn)
-    full_path = await storage_provider.save_file(file_obj, relative_path)
+    ext = os.path.splitext(safe_filename)[1] or (".mp4" if reference_kind == "FACE" else ".wav")
+    upload_id = uuid.uuid4()
 
-    # Convert voice reference audio to clean 22050Hz 16-bit PCM mono WAV for XTTS compatibility
     if reference_kind == "VOICE":
-        clean_wav_path = os.path.join(os.path.dirname(full_path), f"clean_{unique_fn}.wav")
+        # Voice is submitted from the combined camera/microphone recording.
+        # Extract its audio track into a correctly named PCM WAV for XTTS.
+        folder = os.path.join(storage_provider.base_dir, "presenters", presenter_id)
+        os.makedirs(folder, exist_ok=True)
+        source_path = os.path.join(folder, f"voice_source_{upload_id}{ext}")
+        wav_filename = f"voice_{upload_id}.wav"
+        full_path = os.path.join(folder, wav_filename)
+        await storage_provider.save_file(file_obj, os.path.relpath(source_path, storage_provider.base_dir))
+
         conv_cmd = [
-            "ffmpeg", "-y", "-i", full_path,
-            "-vn", "-acodec", "pcm_s16le", "-ar", "22050", "-ac", "1",
-            clean_wav_path
+            "ffmpeg", "-y", "-v", "error", "-i", source_path,
+            "-map", "0:a:0", "-vn", "-acodec", "pcm_s16le", "-ar", "22050", "-ac", "1",
+            full_path,
         ]
         try:
             proc = await asyncio.create_subprocess_exec(
                 *conv_cmd,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
             )
-            await proc.communicate()
-            if os.path.exists(clean_wav_path) and os.path.getsize(clean_wav_path) > 1024:
-                shutil.move(clean_wav_path, full_path)
-        except Exception as e:
-            pass
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0 or not os.path.exists(full_path) or os.path.getsize(full_path) <= 1024:
+                detail = stderr.decode("utf-8", errors="ignore").strip()
+                raise RuntimeError(f"Could not extract voice audio from the presenter recording: {detail}")
+        except Exception:
+            if os.path.exists(full_path):
+                os.remove(full_path)
+            raise
+        finally:
+            if os.path.exists(source_path):
+                os.remove(source_path)
+
+        safe_filename = "voice_reference.wav"
+        mime_type = "audio/wav"
+    else:
+        unique_fn = f"face_{upload_id}{ext}"
+        relative_path = os.path.join("presenters", presenter_id, unique_fn)
+        full_path = await storage_provider.save_file(file_obj, relative_path)
+        safe_filename = os.path.basename(safe_filename)
+        mime_type = mime_type or "video/mp4"
 
     file_size = os.path.getsize(full_path)
 
