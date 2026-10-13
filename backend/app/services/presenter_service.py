@@ -1,6 +1,7 @@
 import os
 import uuid
 import hashlib
+import json
 import shutil
 from datetime import datetime
 from typing import List, Optional, BinaryIO
@@ -159,8 +160,21 @@ async def get_or_generate_presenter_clip(
 
     face_path = presenter.face_reference.path
     audio_hash = compute_file_hash(audio_path)
-    settings_str = f"{settings.get('width', 1280)}x{settings.get('height', 720)}" if settings else "1280x720"
-    settings_hash = hashlib.sha256(settings_str.encode("utf-8")).hexdigest()
+    effective_settings = settings or {"width": 1280, "height": 720}
+    post_processing_enabled = (
+        bool(settings["enable_post_processing"])
+        if settings and "enable_post_processing" in settings
+        else os.getenv("ENABLE_MUSETALK_POST_PROCESSING", "1").lower() in ("1", "true", "yes")
+    )
+    cache_settings = {
+        "generation_version": "musetalk-mouth-detail-v3",
+        "settings": effective_settings,
+        "parsing_mode": effective_settings.get("parsing_mode", os.getenv("MUSETALK_PARSING_MODE", "inner_mouth")),
+        "post_processing_enabled": post_processing_enabled,
+    }
+    settings_hash = hashlib.sha256(
+        json.dumps(cache_settings, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
 
     # Check cache
     cached = db.query(PresenterGenerationCache).filter(
