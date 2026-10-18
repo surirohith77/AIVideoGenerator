@@ -122,7 +122,8 @@ class FFmpegRenderer:
         style_profile: Dict[str, Any],
         scenes: List[Dict[str, Any]],
         output_mp4_path: str,
-        progress_callback = None
+        progress_callback = None,
+        narration_path: Optional[str] = None,
     ) -> str:
         os.makedirs(os.path.dirname(output_mp4_path), exist_ok=True)
         width, height = parse_aspect_ratio(
@@ -171,9 +172,12 @@ class FFmpegRenderer:
             proc = await asyncio.create_subprocess_exec(*concat_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             await proc.communicate()
 
-            # Step 3: Concatenate narration audio
-            merged_narration_path = None
-            if any(audio_paths):
+            # Step 3: Keep continuous narration intact when supplied. Legacy
+            # callers still concatenate per-scene audio as before.
+            merged_narration_path = (
+                narration_path if narration_path and os.path.exists(narration_path) else None
+            )
+            if any(audio_paths) and merged_narration_path is None:
                 # Keep the audio timeline in lockstep with the scene clips. A scene
                 # without narration still occupies time in the video, so represent
                 # it with silence instead of removing it from the audio concat.

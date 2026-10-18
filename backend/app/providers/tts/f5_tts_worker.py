@@ -4,7 +4,6 @@ import contextlib
 from concurrent.futures import Future
 import json
 import os
-import secrets
 import sys
 import traceback
 from typing import Any, Dict
@@ -71,9 +70,9 @@ def main() -> int:
                     nfe_step=request["nfe_step"],
                     speed=request["speed"],
                     cfg_strength=request["cfg_strength"],
-                    # F5-TTS writes its seed into PYTHONHASHSEED. Keep it in
-                    # Python's supported 32-bit range so spawned workers start.
-                    seed=secrets.randbelow(2**32),
+                    # Keep inference reproducible while using the seed selected
+                    # during the controlled voice comparison.
+                    seed=41002,
                 )
             _write_response({"ok": True})
         except Exception as error:

@@ -16,6 +16,7 @@ from app.services.presenter_service import get_or_generate_presenter_clip
 from app.config import settings
 from renderer.ffmpeg_builder import FFmpegRenderer
 from app.utils.ffmpeg_utils import extract_media_metadata
+from app.utils.audio_timeline import split_continuous_audio_by_scenes
 
 logger = logging.getLogger(__name__)
 tts_provider = LocalTTSProvider()
@@ -85,8 +86,8 @@ async def execute_video_generation_job(db_session_factory, job_id: str):
         from app.providers.tts.voice_clone import LocalVoiceCloneProvider
         voice_clone_provider = LocalVoiceCloneProvider()
 
+        scene_contexts = []
         for sc in scenes:
-            sc_audio_path = os.path.join(gen_dir, f"audio_scene_{sc.scene_number:03d}.wav")
             presenter_target_id = sc.presenter_id or job.presenter_id
             
             # Determine whether this scene uses AI Presenter or Media Asset
@@ -116,21 +117,83 @@ async def execute_video_generation_job(db_session_factory, job_id: str):
                         "Please record or upload a voice reference before generating this video."
                     )
 
-            if sc.narration:
-                job.progress = 35
-                job.current_stage = f"GENERATING_VOICE_SCENE_{sc.scene_number}"
-                db.commit()
+            scene_contexts.append({
+                "scene": sc,
+                "presenter_target_id": presenter_target_id,
+                "scene_is_presenter": scene_is_presenter,
+                "voice_ref_path": voice_ref_path,
+            })
 
-                audio_provider = voice_clone_provider if voice_ref_path else tts_provider
-                await audio_provider.generate_audio(
-                    text=sc.narration,
-                    output_path=sc_audio_path,
-                    voice_reference_path=voice_ref_path
-                )
+        narration_texts = [(context["scene"].narration or "").strip() for context in scene_contexts]
+        voice_references = {context["voice_ref_path"] for context in scene_contexts}
+        # One shared voice reference lets F5 keep its cadence/prosody across
+        # visual scene changes. For mixed voices or empty scenes, preserve the
+        # existing per-scene synthesis behavior.
+        continuous_audio_mode = (
+            all(narration_texts)
+            and len(voice_references) == 1
+        )
+        continuous_audio_path = None
+        audio_segments = {}
+        if continuous_audio_mode:
+            voice_ref_path = next(iter(voice_references))
+            audio_provider = voice_clone_provider if voice_ref_path else tts_provider
+            continuous_audio_path = os.path.join(gen_dir, "narration_continuous.wav")
+            job.progress = 35
+            job.current_stage = "GENERATING_CONTINUOUS_NARRATION"
+            db.commit()
+            await audio_provider.generate_audio(
+                text=" ".join(narration_texts),
+                output_path=continuous_audio_path,
+                voice_reference_path=voice_ref_path,
+            )
+            audio_metadata = await extract_media_metadata(continuous_audio_path)
+            narration_duration = float(audio_metadata.get("duration") or 0.0)
+            if not audio_metadata.get("has_audio") or narration_duration <= 0:
+                raise RuntimeError("Continuous narration generation did not produce valid audio.")
 
-                job.progress = 45
-                job.current_stage = "VOICE_GENERATED"
-                db.commit()
+            segments, segment_paths = split_continuous_audio_by_scenes(
+                continuous_audio_path,
+                scenes,
+                narration_duration,
+                gen_dir,
+            )
+            audio_segments = {
+                context["scene"].scene_number: (segment, path)
+                for context, segment, path in zip(scene_contexts, segments, segment_paths)
+            }
+            job.progress = 45
+            job.current_stage = "CONTINUOUS_VOICE_GENERATED"
+            db.commit()
+
+        for context in scene_contexts:
+            sc = context["scene"]
+            presenter_target_id = context["presenter_target_id"]
+            scene_is_presenter = context["scene_is_presenter"]
+            voice_ref_path = context["voice_ref_path"]
+            sc_audio_path = os.path.join(gen_dir, f"audio_scene_{sc.scene_number:03d}.wav")
+
+            if continuous_audio_mode:
+                segment, segmented_path = audio_segments[sc.scene_number]
+                sc_audio_path = segmented_path
+                scene_duration = segment["duration"]
+            else:
+                scene_duration = float(sc.duration or 6.0)
+                if sc.narration:
+                    job.progress = 35
+                    job.current_stage = f"GENERATING_VOICE_SCENE_{sc.scene_number}"
+                    db.commit()
+
+                    audio_provider = voice_clone_provider if voice_ref_path else tts_provider
+                    await audio_provider.generate_audio(
+                        text=sc.narration,
+                        output_path=sc_audio_path,
+                        voice_reference_path=voice_ref_path
+                    )
+
+                    job.progress = 45
+                    job.current_stage = "VOICE_GENERATED"
+                    db.commit()
 
             asset_path = None
             visual_type = sc.visual_type
@@ -162,8 +225,7 @@ async def execute_video_generation_job(db_session_factory, job_id: str):
                     if asset and os.path.exists(asset.path):
                         asset_path = asset.path
 
-            scene_duration = float(sc.duration or 6.0)
-            if os.path.exists(sc_audio_path):
+            if not continuous_audio_mode and os.path.exists(sc_audio_path):
                 audio_metadata = await extract_media_metadata(sc_audio_path)
                 audio_duration = float(audio_metadata.get("duration") or 0.0)
                 if audio_metadata.get("has_audio") and audio_duration > 0:
@@ -184,7 +246,11 @@ async def execute_video_generation_job(db_session_factory, job_id: str):
                 "transition": sc.transition,
                 "caption": sc.caption or sc.narration,
                 "asset_path": asset_path,
-                "audio_path": sc_audio_path if os.path.exists(sc_audio_path) else None
+                "audio_path": (
+                    sc_audio_path
+                    if scene_is_presenter and os.path.exists(sc_audio_path)
+                    else (sc_audio_path if not continuous_audio_mode and os.path.exists(sc_audio_path) else None)
+                )
             })
 
         # Stage 3: Resolve Style Assets (Music, Logo)
@@ -225,7 +291,8 @@ async def execute_video_generation_job(db_session_factory, job_id: str):
             style_profile=style_dict,
             scenes=scene_dicts,
             output_mp4_path=output_mp4,
-            progress_callback=update_render_progress
+            progress_callback=update_render_progress,
+            narration_path=continuous_audio_path,
         )
 
         # Stage 5: Finalize & Create Video record

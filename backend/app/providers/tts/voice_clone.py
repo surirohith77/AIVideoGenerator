@@ -9,6 +9,7 @@ from collections import deque
 from pathlib import Path
 from typing import Optional, Dict, Any
 from app.providers.tts.base import TTSProvider
+from app.providers.tts.f5_audio_postprocess import shorten_long_silences
 from app.utils.media_verification import verify_output_media_file
 
 logger = logging.getLogger(__name__)
@@ -405,6 +406,15 @@ class LocalVoiceCloneProvider(TTSProvider):
 
         if not os.path.isfile(output_path) or os.path.getsize(output_path) <= 1024:
             raise RuntimeError("F5-TTS completed without producing a valid audio file.")
+
+        removed_pause_seconds = shorten_long_silences(output_path)
+        if removed_pause_seconds:
+            logger.info(
+                "F5-TTS shortened long pauses by %.2f seconds (minimum=%ss, retained=%ss)",
+                removed_pause_seconds,
+                os.getenv("F5_TTS_PAUSE_MIN_SECONDS", "0.60"),
+                os.getenv("F5_TTS_PAUSE_RETAIN_SECONDS", "0.32"),
+            )
 
         verification = await verify_output_media_file(output_path, require_audio=True)
         logger.info(
