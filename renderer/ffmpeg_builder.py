@@ -97,6 +97,9 @@ class FFmpegRenderer:
                 output_clip_path
             ]
         else:
+            asset_start_time = max(0.0, float(scene.get("asset_start_time", 0.0)))
+            input_args = ["-ss", f"{asset_start_time:.6f}"] if asset_start_time else []
+            input_args.extend(["-i", asset_path])
             filtergraph = (
                 f"setpts=PTS-STARTPTS,fps=30:start_time=0,"
                 f"tpad=stop_mode=clone:stop_duration={render_duration},"
@@ -105,7 +108,7 @@ class FFmpegRenderer:
                 f"crop={width}:{height},format=yuv420p"
             )
             cmd = [
-                "ffmpeg", "-y", "-i", asset_path,
+                "ffmpeg", "-y", *input_args,
                 "-vf", filtergraph,
                 "-frames:v", str(frame_count), "-an",
                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "30",
@@ -145,32 +148,56 @@ class FFmpegRenderer:
                 previous_frame_end = frame_end
                 render_scenes.append(render_scene)
 
-            # Step 1: Render individual scene clips
-            for idx, scene in enumerate(render_scenes, 1):
-                if progress_callback:
-                    await progress_callback(stage="CREATING_SCENES", progress=int(20 + (idx / len(scenes)) * 40))
-                
-                clip_file = os.path.join(temp_dir, f"scene_{idx:03d}.mp4")
-                await self.render_scene_clip(scene, idx, width, height, clip_file)
-                clip_paths.append(clip_file)
+            # Reuse a single, time-aligned presenter stream when every scene
+            # references consecutive ranges of that same generated clip. This
+            # avoids re-encoding joins that can look like fresh video starts.
+            continuous_visual_path = render_scenes[0].get("asset_path") if render_scenes else None
+            expected_start = 0.0
+            for scene in render_scenes:
+                scene_path = scene.get("asset_path")
+                scene_start = float(scene.get("asset_start_time", 0.0))
+                if (
+                    not continuous_visual_path
+                    or scene.get("visual_type") != "VIDEO"
+                    or scene_path != continuous_visual_path
+                    or abs(scene_start - expected_start) > 0.04
+                ):
+                    continuous_visual_path = None
+                    break
+                expected_start += float(scene.get("duration", 6.0))
 
-                audio_path = scene.get("audio_path")
-                audio_paths.append(audio_path if audio_path and os.path.exists(audio_path) else None)
+            if continuous_visual_path:
+                merged_visual_path = continuous_visual_path
+                for scene in render_scenes:
+                    audio_path = scene.get("audio_path")
+                    audio_paths.append(audio_path if audio_path and os.path.exists(audio_path) else None)
+            else:
+                # Step 1: Render individual scene clips
+                for idx, scene in enumerate(render_scenes, 1):
+                    if progress_callback:
+                        await progress_callback(stage="CREATING_SCENES", progress=int(20 + (idx / len(scenes)) * 40))
 
-            # Step 2: Concatenate scene clips
-            concat_list_file = os.path.join(temp_dir, "clips.txt")
-            with open(concat_list_file, "w") as f:
-                for cp in clip_paths:
-                    f.write(f"file '{cp}'\n")
+                    clip_file = os.path.join(temp_dir, f"scene_{idx:03d}.mp4")
+                    await self.render_scene_clip(scene, idx, width, height, clip_file)
+                    clip_paths.append(clip_file)
 
-            merged_visual_path = os.path.join(temp_dir, "merged_visuals.mp4")
-            concat_cmd = [
-                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                "-i", concat_list_file,
-                "-c", "copy", merged_visual_path
-            ]
-            proc = await asyncio.create_subprocess_exec(*concat_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-            await proc.communicate()
+                    audio_path = scene.get("audio_path")
+                    audio_paths.append(audio_path if audio_path and os.path.exists(audio_path) else None)
+
+                # Step 2: Concatenate scene clips
+                concat_list_file = os.path.join(temp_dir, "clips.txt")
+                with open(concat_list_file, "w") as f:
+                    for cp in clip_paths:
+                        f.write(f"file '{cp}'\n")
+
+                merged_visual_path = os.path.join(temp_dir, "merged_visuals.mp4")
+                concat_cmd = [
+                    "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                    "-i", concat_list_file,
+                    "-c", "copy", merged_visual_path
+                ]
+                proc = await asyncio.create_subprocess_exec(*concat_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                await proc.communicate()
 
             # Step 3: Keep continuous narration intact when supplied. Legacy
             # callers still concatenate per-scene audio as before.
@@ -225,7 +252,18 @@ class FFmpegRenderer:
 
             # Step 4: Final FFmpeg Assembly
             ffmpeg_inputs = ["-i", merged_visual_path]
-            filter_complex_parts = ["[0:v]setpts=PTS-STARTPTS[vbase]"]
+            if continuous_visual_path:
+                total_video_duration = sum(float(scene.get("duration", 6.0)) for scene in render_scenes)
+                visual_filter = (
+                    f"setpts=PTS-STARTPTS,fps=30,"
+                    f"tpad=stop_mode=clone:stop_duration={total_video_duration:.6f},"
+                    f"trim=duration={total_video_duration:.6f},"
+                    f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+                    f"crop={width}:{height},format=yuv420p"
+                )
+                filter_complex_parts = [f"[0:v]{visual_filter}[vbase]"]
+            else:
+                filter_complex_parts = ["[0:v]setpts=PTS-STARTPTS[vbase]"]
             input_idx = 1
 
             if merged_narration_path and os.path.exists(merged_narration_path):

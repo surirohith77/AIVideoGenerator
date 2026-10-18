@@ -135,6 +135,7 @@ async def execute_video_generation_job(db_session_factory, job_id: str):
         )
         continuous_audio_path = None
         audio_segments = {}
+        segment_by_scene = {}
         if continuous_audio_mode:
             voice_ref_path = next(iter(voice_references))
             audio_provider = voice_clone_provider if voice_ref_path else tts_provider
@@ -162,9 +163,35 @@ async def execute_video_generation_job(db_session_factory, job_id: str):
                 context["scene"].scene_number: (segment, path)
                 for context, segment, path in zip(scene_contexts, segments, segment_paths)
             }
+            segment_by_scene = {
+                context["scene"].scene_number: segment
+                for context, segment in zip(scene_contexts, segments)
+            }
             job.progress = 45
             job.current_stage = "CONTINUOUS_VOICE_GENERATED"
             db.commit()
+
+        # Generate the presenter once from the full narration. Scene clips then
+        # seek into this same video timeline instead of restarting MuseTalk for
+        # every presenter scene.
+        presenter_ids = {
+            context["presenter_target_id"]
+            for context in scene_contexts
+            if context["presenter_target_id"]
+        }
+        continuous_presenter_video_path = None
+        continuous_presenter_id = next(iter(presenter_ids)) if len(presenter_ids) == 1 else None
+        if continuous_audio_mode and continuous_audio_path and continuous_presenter_id:
+            job.progress = 50
+            job.current_stage = "LIP_SYNC_FULL_NARRATION"
+            db.commit()
+            continuous_presenter_video_path = await get_or_generate_presenter_clip(
+                db=db,
+                presenter_id=continuous_presenter_id,
+                audio_path=continuous_audio_path,
+                output_dir=gen_dir,
+                settings={"width": 1920, "height": 1080},
+            )
 
         for context in scene_contexts:
             sc = context["scene"]
@@ -198,7 +225,12 @@ async def execute_video_generation_job(db_session_factory, job_id: str):
             asset_path = None
             visual_type = sc.visual_type
 
-            if scene_is_presenter:
+            scene_asset_start_time = 0.0
+            if scene_is_presenter and continuous_presenter_video_path:
+                asset_path = continuous_presenter_video_path
+                visual_type = "VIDEO"
+                scene_asset_start_time = segment_by_scene[sc.scene_number]["start"]
+            elif scene_is_presenter:
                 if not presenter_target_id:
                     raise ValueError(f"ERROR: Scene {sc.scene_number} is in PRESENTER mode but no presenter_id was assigned.")
 
@@ -225,6 +257,24 @@ async def execute_video_generation_job(db_session_factory, job_id: str):
                     if asset and os.path.exists(asset.path):
                         asset_path = asset.path
 
+                # A selected presenter is a useful visual fallback when a
+                # content scene has no matched media asset. In continuous mode
+                # this is a time slice of the same full lip-synced clip.
+                if not asset_path and continuous_presenter_video_path:
+                    asset_path = continuous_presenter_video_path
+                    visual_type = "VIDEO"
+                    scene_asset_start_time = segment_by_scene[sc.scene_number]["start"]
+                elif not asset_path and presenter_target_id and os.path.exists(sc_audio_path):
+                    presenter_clip = await get_or_generate_presenter_clip(
+                        db=db,
+                        presenter_id=presenter_target_id,
+                        audio_path=sc_audio_path,
+                        output_dir=gen_dir,
+                        settings={"width": 1920, "height": 1080},
+                    )
+                    asset_path = presenter_clip
+                    visual_type = "VIDEO"
+
             if not continuous_audio_mode and os.path.exists(sc_audio_path):
                 audio_metadata = await extract_media_metadata(sc_audio_path)
                 audio_duration = float(audio_metadata.get("duration") or 0.0)
@@ -246,6 +296,7 @@ async def execute_video_generation_job(db_session_factory, job_id: str):
                 "transition": sc.transition,
                 "caption": sc.caption or sc.narration,
                 "asset_path": asset_path,
+                "asset_start_time": scene_asset_start_time,
                 "audio_path": (
                     sc_audio_path
                     if scene_is_presenter and os.path.exists(sc_audio_path)
